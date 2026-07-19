@@ -1,6 +1,11 @@
 # Local-File-Converter
 A python app with HTML frontend that allows you to host your own file converter locally on your machine or over your LAN
 
+<img width="461" height="229" alt="image" src="https://github.com/user-attachments/assets/84a8e61e-5cfb-4003-915e-57b11fd8220a" />
+<img width="461" height="229" alt="image" src="https://github.com/user-attachments/assets/9712295d-a38d-44a3-b2e7-ec949dd0eeb1" />
+<img width="461" height="229" alt="image" src="https://github.com/user-attachments/assets/88cb76dc-4448-476d-b121-eba1ea8f69d0" />
+
+
 ## Features
 
 * Convert images, videos, and audio through a HTML interface.
