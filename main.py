@@ -19,6 +19,8 @@ import sys
 import threading
 import uuid
 import re
+import socket
+import ipaddress
 from flask import Flask, request, send_file, render_template_string, jsonify, after_this_request
 from waitress import serve
 
@@ -34,6 +36,16 @@ HIDE_CONSOLE_WINDOW = True
 #          '127.0.0.1' = local machine only
 HOST = '0.0.0.0'
 PORT = 8089
+
+# Video performance. "auto" tests NVIDIA/Intel/AMD hardware encoders and
+# safely falls back to libx264. Set to "software" to force CPU encoding.
+VIDEO_ENCODER_MODE = "auto"
+VIDEO_SOFTWARE_PRESET = "veryfast"  # ultrafast, superfast, veryfast, faster, fast, medium...
+VIDEO_DEFAULT_CRF = 23
+
+# Small/medium files are uploaded in full for reliable FFprobe metadata. Large
+# files use browser-side width/height detection to avoid uploading them twice.
+PROBE_FULL_UPLOAD_LIMIT_MB = 64
 
 FAVICON_BASE64 = """data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAB8AAAAfCAYAA
 AAfrhY5AAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAAEnQAABJ0Ad5mH3gAAAEJ
@@ -207,6 +219,67 @@ def make_startupinfo():
         return si
     return None
 
+_VIDEO_ENCODER_CACHE = None
+
+def _encoder_smoke_test(encoder):
+    """Return True only when FFmpeg can actually initialise this encoder."""
+    cmd = [
+        FFMPEG_CMD, "-hide_banner", "-loglevel", "error",
+        "-f", "lavfi", "-i", "color=c=black:s=64x64:r=1:d=0.15",
+        "-frames:v", "1", "-an", "-c:v", encoder,
+        "-f", "null", "-"
+    ]
+    try:
+        result = subprocess.run(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            startupinfo=make_startupinfo(), timeout=12
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+def get_fast_h264_encoder():
+    """Choose a working H.264 encoder once, preferring GPU hardware."""
+    global _VIDEO_ENCODER_CACHE
+    if _VIDEO_ENCODER_CACHE:
+        return _VIDEO_ENCODER_CACHE
+
+    candidates = ["libx264"]
+    if VIDEO_ENCODER_MODE.strip().lower() == "auto":
+        candidates = ["h264_nvenc", "h264_qsv", "h264_amf", "libx264"]
+
+    for encoder in candidates:
+        if _encoder_smoke_test(encoder):
+            _VIDEO_ENCODER_CACHE = encoder
+            print(f"Video encoder selected: {encoder}")
+            return encoder
+
+    _VIDEO_ENCODER_CACHE = "libx264"
+    print("⚠️  No tested hardware encoder was available; using libx264.")
+    return _VIDEO_ENCODER_CACHE
+
+def append_h264_speed_options(cmd, encoder):
+    cmd.extend(["-c:v", encoder])
+    if encoder == "h264_nvenc":
+        cmd.extend(["-preset", "p4"])
+    elif encoder == "h264_qsv":
+        cmd.extend(["-preset", "veryfast"])
+    elif encoder == "h264_amf":
+        cmd.extend(["-quality", "speed"])
+    else:
+        cmd.extend(["-preset", VIDEO_SOFTWARE_PRESET, "-threads", "0"])
+
+def append_video_quality_options(cmd, encoder, quality):
+    q = str(quality or VIDEO_DEFAULT_CRF)
+    if encoder == "h264_nvenc":
+        cmd.extend(["-rc", "vbr", "-cq", q, "-b:v", "0"])
+    elif encoder == "h264_qsv":
+        cmd.extend(["-global_quality", q])
+    elif encoder == "h264_amf":
+        cmd.extend(["-qp_i", q, "-qp_p", q])
+    else:
+        cmd.extend(["-crf", q])
+
 def background_convert(job_id, session_dir, files_data, output_format, settings_form):
     total_files = len(files_data)
     results = []
@@ -271,22 +344,42 @@ def background_convert(job_id, session_dir, files_data, output_format, settings_
                 if vf_parts:
                     cmd.extend(["-vf", ",".join(vf_parts)])
 
-                # Quality
+                # Encoder / quality. Common H.264 containers use a tested GPU
+                # encoder when available, otherwise a much faster CPU preset.
                 q = settings_form.get(f"setting_{index}_Quality", "").strip()
-                if q:
-                    qv = validate_settings(q,"Quality")
-                    if out_type=="image":  cmd.extend(["-q:v", qv])
-                    elif out_type=="video": cmd.extend(["-crf", qv])
+                qv = validate_settings(q, "Quality") if q else None
+                vb = settings_form.get(f"setting_{index}_Video_Bitrate","").strip()
+                vbv = validate_settings(vb, "Video Bitrate") if vb else None
+                selected_encoder = None
 
-                # FPS / bitrate / audio
+                if out_type == "image" and qv:
+                    cmd.extend(["-q:v", qv])
+                elif out_type == "video":
+                    if output_format in {"MP4", "MOV", "MKV"}:
+                        selected_encoder = get_fast_h264_encoder()
+                        append_h264_speed_options(cmd, selected_encoder)
+                        cmd.extend(["-pix_fmt", "yuv420p", "-c:a", "aac"])
+                    elif output_format == "WEBM":
+                        cmd.extend(["-c:v", "libvpx-vp9", "-deadline", "good",
+                                    "-cpu-used", "5", "-row-mt", "1", "-threads", "0"])
+
+                    if vbv:
+                        cmd.extend(["-b:v", vbv])
+                    elif selected_encoder:
+                        append_video_quality_options(cmd, selected_encoder, qv)
+                    elif qv:
+                        cmd.extend(["-crf", qv])
+
+                # FPS / audio
                 fps = settings_form.get(f"setting_{index}_FPS","").strip()
                 if fps and out_type=="video": cmd.extend(["-r", validate_settings(fps,"FPS")])
-                vb = settings_form.get(f"setting_{index}_Video_Bitrate","").strip()
-                if vb  and out_type=="video": cmd.extend(["-b:v", validate_settings(vb,"Video Bitrate")])
                 ab = settings_form.get(f"setting_{index}_Audio_Bitrate","").strip()
                 if ab: cmd.extend(["-b:a", validate_settings(ab,"Audio Bitrate")])
                 sr = settings_form.get(f"setting_{index}_Sample_Rate","").strip()
                 if sr: cmd.extend(["-ar", validate_settings(sr,"Sample Rate")])
+
+                if output_format in {"MP4", "MOV"}:
+                    cmd.extend(["-movflags", "+faststart"])
 
             cmd.append(out_path)
             print(f"[JOB {job_id[:8]}] CMD: {' '.join(cmd)}")
@@ -403,24 +496,36 @@ select{width:100%;padding:.75rem;border-radius:8px;border:1px solid var(--border
 .preview-btn:hover{background:var(--primary);color:#fff;}
 .edit-badge{display:none;margin-left:6px;background:var(--primary);color:#fff;font-size:.7rem;padding:.1rem .45rem;border-radius:999px;white-space:nowrap;flex-shrink:0;}
 /* ---- Modal ---- */
-.modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.88);z-index:3000;align-items:center;justify-content:center;padding:1rem;}
-.modal-box{background:var(--panel);border-radius:16px;border:1px solid var(--border);width:100%;max-width:860px;max-height:92vh;overflow-y:auto;padding:1.5rem;position:relative;}
+.modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.88);z-index:3000;align-items:center;justify-content:center;padding:1rem;overscroll-behavior:contain;}
+.modal-box{background:var(--panel);border-radius:16px;border:1px solid var(--border);width:100%;max-width:860px;max-height:92vh;overflow-y:auto;padding:1.5rem;position:relative;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;}
+html.crop-modal-open,body.crop-modal-open{overflow:hidden!important;overscroll-behavior:none!important;}
 .modal-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem;gap:1rem;}
 .modal-header span{font-weight:600;font-size:1rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
 .modal-close{background:transparent;border:1px solid var(--border);color:var(--text);width:36px;height:36px;border-radius:8px;cursor:pointer;font-size:1.2rem;flex-shrink:0;}
 .preview-zone{background:#000;border-radius:8px;overflow:hidden;text-align:center;position:relative;margin-bottom:1rem;min-height:120px;display:flex;align-items:center;justify-content:center;}
-#imageCropCanvas{cursor:crosshair;display:block;max-width:100%;}
+.image-crop-zone{overflow:visible;padding:28px;touch-action:none;overscroll-behavior:none;-webkit-user-select:none;user-select:none;}
+.crop-canvas-shell{position:relative;display:inline-block;max-width:100%;line-height:0;overflow:visible;touch-action:none;overscroll-behavior:none;}
+.video-crop-shell{display:none;margin:.5rem auto 0;}
+.crop-canvas{cursor:crosshair;display:block;width:100%;height:auto;max-width:100%;touch-action:none;overscroll-behavior:none;-webkit-user-select:none;user-select:none;}
+.crop-touch-layer{position:absolute;inset:0;z-index:20;overflow:visible;touch-action:none;overscroll-behavior:none;-webkit-user-select:none;user-select:none;cursor:move;}
+.crop-touch-rect{position:absolute;border:2px solid rgba(255,255,255,.9);box-shadow:0 0 0 1px rgba(0,0,0,.45);pointer-events:none;}
+.crop-touch-handle{position:absolute;width:48px;height:48px;transform:translate(-50%,-50%);border:0;background:transparent;padding:0;margin:0;z-index:22;touch-action:none;-webkit-user-select:none;user-select:none;}
+.crop-touch-handle::after{content:'';position:absolute;left:50%;top:50%;width:14px;height:14px;transform:translate(-50%,-50%);border-radius:50%;background:#fff;border:2px solid #1f2937;box-shadow:0 1px 5px rgba(0,0,0,.65);}
+.crop-touch-handle[data-handle=nw],.crop-touch-handle[data-handle=se]{cursor:nwse-resize;}
+.crop-touch-handle[data-handle=ne],.crop-touch-handle[data-handle=sw]{cursor:nesw-resize;}
+.crop-touch-handle[data-handle=n],.crop-touch-handle[data-handle=s]{cursor:ns-resize;}
+.crop-touch-handle[data-handle=e],.crop-touch-handle[data-handle=w]{cursor:ew-resize;}
 #previewVideo{max-width:100%;max-height:340px;display:block;}
-#videoCropCanvas{cursor:crosshair;display:none;max-width:100%;margin-top:.5rem;}
 .capture-btn{background:var(--item-bg);border:1px solid var(--border);color:var(--text);padding:.45rem .9rem;border-radius:6px;cursor:pointer;font-size:.85rem;margin:.5rem 0;}
 .capture-btn:hover{background:var(--primary);color:#fff;}
 /* ---- Clip timeline ---- */
 .clip-section{margin-top:.5rem;}
 .clip-section h4{color:var(--primary);font-size:.95rem;margin-bottom:.6rem;}
-.clip-timeline{position:relative;height:44px;background:var(--item-bg);border-radius:6px;cursor:pointer;user-select:none;margin-bottom:.75rem;}
-#clipRange{position:absolute;top:0;height:100%;background:var(--primary);opacity:.35;pointer-events:none;}
-.clip-handle{position:absolute;top:0;bottom:0;width:13px;background:var(--primary);border-radius:4px;cursor:ew-resize;transform:translateX(-50%);z-index:2;display:flex;align-items:center;justify-content:center;}
-.clip-handle::after{content:'|||';color:rgba(255,255,255,.7);font-size:7px;letter-spacing:-1px;}
+.clip-timeline{position:relative;height:52px;background:var(--item-bg);border-radius:6px;cursor:pointer;user-select:none;margin-bottom:.75rem;touch-action:none;overscroll-behavior:none;-webkit-user-select:none;}
+#clipRange{position:absolute;top:4px;bottom:4px;background:var(--primary);opacity:.35;pointer-events:none;border-radius:4px;}
+.clip-handle{position:absolute;top:0;height:52px;width:44px;cursor:ew-resize;transform:translateX(-50%);z-index:4;touch-action:none;background:transparent;}
+.clip-handle::before{content:'';position:absolute;left:50%;top:4px;bottom:4px;width:13px;transform:translateX(-50%);background:var(--primary);border-radius:4px;box-shadow:0 1px 4px rgba(0,0,0,.35);}
+.clip-handle::after{content:'|||';position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);color:rgba(255,255,255,.78);font-size:7px;letter-spacing:-1px;}
 #clipPlayhead{position:absolute;top:0;bottom:0;width:2px;background:rgba(255,255,255,.75);pointer-events:none;z-index:3;}
 .clip-info{display:flex;gap:1.5rem;align-items:center;flex-wrap:wrap;font-size:.88rem;}
 .clip-info>span{display:flex;align-items:center;gap:.4rem;color:var(--text-muted);}
@@ -460,7 +565,15 @@ select{width:100%;padding:.75rem;border-radius:8px;border:1px solid var(--border
 
     <!-- Image preview area -->
     <div id="imagePreviewWrap" style="display:none;">
-      <div class="preview-zone"><canvas id="imageCropCanvas"></canvas></div>
+      <div class="preview-zone image-crop-zone" id="imageCropZone">
+        <div class="crop-canvas-shell" id="imageCropShell">
+          <canvas id="imageCropCanvas" class="crop-canvas"></canvas>
+          <div id="imageCropTouchLayer" class="crop-touch-layer" aria-label="Touch crop controls">
+            <div id="imageCropTouchRect" class="crop-touch-rect"></div>
+            <button type="button" class="crop-touch-handle" data-handle="nw" aria-label="Crop handle nw"></button><button type="button" class="crop-touch-handle" data-handle="n" aria-label="Crop handle n"></button><button type="button" class="crop-touch-handle" data-handle="ne" aria-label="Crop handle ne"></button><button type="button" class="crop-touch-handle" data-handle="e" aria-label="Crop handle e"></button><button type="button" class="crop-touch-handle" data-handle="se" aria-label="Crop handle se"></button><button type="button" class="crop-touch-handle" data-handle="s" aria-label="Crop handle s"></button><button type="button" class="crop-touch-handle" data-handle="sw" aria-label="Crop handle sw"></button><button type="button" class="crop-touch-handle" data-handle="w" aria-label="Crop handle w"></button>
+          </div>
+        </div>
+      </div>
     </div>
 
     <!-- Video preview area -->
@@ -474,7 +587,13 @@ select{width:100%;padding:.75rem;border-radius:8px;border:1px solid var(--border
       </div>
       <div id="videoCropWrap">
         <button type="button" class="capture-btn" onclick="captureVideoFrame()">📷 Capture Current Frame for Crop</button>
-        <canvas id="videoCropCanvas"></canvas>
+        <div class="crop-canvas-shell video-crop-shell" id="videoCropShell">
+          <canvas id="videoCropCanvas" class="crop-canvas"></canvas>
+          <div id="videoCropTouchLayer" class="crop-touch-layer" aria-label="Video touch crop controls">
+            <div id="videoCropTouchRect" class="crop-touch-rect"></div>
+            <button type="button" class="crop-touch-handle" data-handle="nw" aria-label="Video crop handle nw"></button><button type="button" class="crop-touch-handle" data-handle="n" aria-label="Video crop handle n"></button><button type="button" class="crop-touch-handle" data-handle="ne" aria-label="Video crop handle ne"></button><button type="button" class="crop-touch-handle" data-handle="e" aria-label="Video crop handle e"></button><button type="button" class="crop-touch-handle" data-handle="se" aria-label="Video crop handle se"></button><button type="button" class="crop-touch-handle" data-handle="s" aria-label="Video crop handle s"></button><button type="button" class="crop-touch-handle" data-handle="sw" aria-label="Video crop handle sw"></button><button type="button" class="crop-touch-handle" data-handle="w" aria-label="Video crop handle w"></button>
+          </div>
+        </div>
       </div>
 
       <!-- Clip section -->
@@ -482,8 +601,8 @@ select{width:100%;padding:.75rem;border-radius:8px;border:1px solid var(--border
         <h4>✂️ Clip</h4>
         <div class="clip-timeline" id="clipTimeline">
           <div id="clipRange"></div>
-          <div class="clip-handle" id="clipStartHandle" style="left:0%"></div>
-          <div class="clip-handle" id="clipEndHandle"   style="left:100%"></div>
+          <div class="clip-handle" id="clipStartHandle" data-clip-handle="start" role="slider" aria-label="Clip start" style="left:0%"></div>
+          <div class="clip-handle" id="clipEndHandle" data-clip-handle="end" role="slider" aria-label="Clip end" style="left:100%"></div>
           <div id="clipPlayhead" style="left:0%"></div>
         </div>
         <div class="clip-info">
@@ -635,17 +754,68 @@ function populateSelects(targetSel, filterMedia=null) {
     });
 }
 
+function probeInBrowser(file) {
+    const ext = (file.name.split('.').pop() || '').toLowerCase();
+    const imageExts = new Set(['jpg','jpeg','jfif','png','webp','gif','bmp','tif','tiff','avif','heic','heif']);
+    const videoExts = new Set(['mp4','mov','m4v','mkv','avi','webm','wmv','flv','mpg','mpeg','ts','mts','m2ts','3gp']);
+
+    if (imageExts.has(ext) && 'createImageBitmap' in window) {
+        return createImageBitmap(file).then(bitmap => {
+            const meta = {Resolution: `${bitmap.width}x${bitmap.height}`};
+            bitmap.close();
+            return meta;
+        }).catch(() => ({}));
+    }
+
+    if (videoExts.has(ext)) {
+        return new Promise(resolve => {
+            const video = document.createElement('video');
+            const url = URL.createObjectURL(file);
+            let settled = false;
+            const finish = meta => {
+                if (settled) return;
+                settled = true;
+                URL.revokeObjectURL(url);
+                video.removeAttribute('src');
+                resolve(meta);
+            };
+            video.preload = 'metadata';
+            video.muted = true;
+            video.onloadedmetadata = () => finish(
+                video.videoWidth && video.videoHeight
+                    ? {Resolution: `${video.videoWidth}x${video.videoHeight}`}
+                    : {}
+            );
+            video.onerror = () => finish({});
+            video.src = url;
+            setTimeout(() => finish({}), 8000);
+        });
+    }
+
+    return Promise.resolve({});
+}
+
 async function probeFileDefaults(file, index) {
+    // Populate dimensions immediately without uploading the file.
+    const localMeta = await probeInBrowser(file);
+    fileDefaults[index] = {...(fileDefaults[index] || {}), ...localMeta};
+    if (outputFormatSel.value) renderSettings();
+
+    // FFprobe needs a complete MP4/MOV file because its metadata can be at the
+    // end. Never send a truncated first chunk: it produces the reported error.
+    const fullProbeLimit = {{ probe_full_upload_limit_bytes }};
+    if (file.size > fullProbeLimit) return;
+
     try {
-        const chunk = file.slice(0, 5*1024*1024);
         const fd = new FormData();
-        fd.append('file', chunk, file.name);
+        fd.append('file', file, file.name);
         const res = await fetch('/probe', {method:'POST', body:fd});
         if (res.ok) {
-            fileDefaults[index] = await res.json();
+            const serverMeta = await res.json();
+            fileDefaults[index] = {...(fileDefaults[index] || {}), ...serverMeta};
             if (outputFormatSel.value) renderSettings();
         }
-    } catch(e) { console.error('Probe failed', e); }
+    } catch(e) { console.warn('Optional metadata probe failed:', e); }
 }
 
 function updateDetails(type) {
@@ -1018,6 +1188,8 @@ let modal = {
     isClipDrag:false, clipDragType:null,
     capturedImg:null,
     dpr:1, activeCropCanvas:null, _docCropHandlersAdded:false,
+    activePointerId:null, clipPointerId:null, clipTimelineBound:false, documentTouchGuardBound:false, pageScrollLocked:false,
+    savedPageScrollY:0, savedBodyStyles:null,
 };
 let cropPreviewActive = false;
 
@@ -1031,6 +1203,7 @@ function openPreviewModal(index) {
     const ext = file.name.split('.').pop().toLowerCase();
     modal.mediaType = VIDEO_EXTS.has(ext) ? 'video' : 'image';
     document.getElementById('modalFileName').textContent = file.name;
+    lockPageBehindCropModal();
     document.getElementById('previewModal').style.display = 'flex';
     const existing = fileEdits[index] || {};
     if (modal.mediaType==='video') initVideoPreview(existing);
@@ -1056,7 +1229,7 @@ function initImagePreview(existing) {
 function initVideoPreview(existing) {
     document.getElementById('imagePreviewWrap').style.display = 'none';
     document.getElementById('videoPreviewWrap').style.display = 'block';
-    document.getElementById('videoCropCanvas').style.display = 'none';
+    document.getElementById('videoCropShell').style.display = 'none';
     const video = document.getElementById('previewVideo');
     video.src = modal.objectUrl; video.load();
     video.onloadedmetadata = () => {
@@ -1071,13 +1244,14 @@ function initVideoPreview(existing) {
 
 function captureVideoFrame() {
     const video = document.getElementById('previewVideo');
-    if (!video.src) return;
+    if (!video.src || !video.videoWidth || !video.videoHeight) return;
     const canvas = document.getElementById('videoCropCanvas');
+    const shell = document.getElementById('videoCropShell');
     sizeCropCanvas(canvas, video.videoWidth, video.videoHeight);
-    canvas.style.display = 'block';
+    shell.style.display = 'inline-block';
     const ctx = canvas.getContext('2d');
     ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-    // Bake frame into an image so drawCrop can redraw without the video
+    // Bake the current frame into an image so crop redraws are stable while the video plays.
     const frameImg = new Image();
     frameImg.src = canvas.toDataURL();
     frameImg.onload = () => {
@@ -1088,16 +1262,23 @@ function captureVideoFrame() {
 }
 
 function sizeCropCanvas(canvas, nw, nh) {
-    const dpr  = window.devicePixelRatio || 1;
-    const maxW = Math.min(document.querySelector('.modal-box').clientWidth - 32, 800);
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const modalBox = document.querySelector('.modal-box');
+    const maxW = Math.min(Math.max(160, modalBox.clientWidth - 72), 800);
     const maxH = Math.min(window.innerHeight * 0.5, 480);
     const scale = Math.min(maxW/nw, maxH/nh, 1);
-    const cssW = Math.round(nw * scale);
-    const cssH = Math.round(nh * scale);
-    canvas.width  = cssW * dpr;
-    canvas.height = cssH * dpr;
-    canvas.style.width  = cssW + 'px';
-    canvas.style.height = cssH + 'px';
+    const cssW = Math.max(1, Math.round(nw * scale));
+    const cssH = Math.max(1, Math.round(nh * scale));
+    canvas.width  = Math.max(1, Math.round(cssW * dpr));
+    canvas.height = Math.max(1, Math.round(cssH * dpr));
+    canvas.style.width = '100%';
+    canvas.style.height = 'auto';
+    const shell = canvas.closest('.crop-canvas-shell');
+    if (shell) {
+        shell.style.width = cssW + 'px';
+        shell.style.maxWidth = '100%';
+        shell.style.aspectRatio = `${nw} / ${nh}`;
+    }
     modal.dpr = dpr;
 }
 
@@ -1139,6 +1320,8 @@ function drawCrop(canvas) {
         ctx.fillStyle='#fff'; ctx.strokeStyle='#444'; ctx.lineWidth=dpr;
         ctx.fillRect(h.cx-hs,h.cy-hs,hs*2,hs*2); ctx.strokeRect(h.cx-hs,h.cy-hs,hs*2,hs*2);
     });
+
+    updateCropTouchOverlay(canvas);
 }
 
 function handles(sx,sy,sw,sh){
@@ -1165,46 +1348,167 @@ function canvasXY(canvas,e){
     return {mx:(e.clientX-r.left)*(canvas.width/r.width),my:(e.clientY-r.top)*(canvas.height/r.height)};
 }
 
+function lockPageBehindCropModal(){
+    if(modal.pageScrollLocked)return;
+    modal.pageScrollLocked=true;
+    modal.savedPageScrollY=window.scrollY||document.documentElement.scrollTop||0;
+    const b=document.body;
+    modal.savedBodyStyles={position:b.style.position,top:b.style.top,left:b.style.left,right:b.style.right,width:b.style.width,overflow:b.style.overflow};
+    document.documentElement.classList.add('crop-modal-open');
+    b.classList.add('crop-modal-open');
+    b.style.position='fixed';
+    b.style.top=`-${modal.savedPageScrollY}px`;
+    b.style.left='0'; b.style.right='0'; b.style.width='100%'; b.style.overflow='hidden';
+}
+
+function unlockPageBehindCropModal(){
+    if(!modal.pageScrollLocked)return;
+    modal.pageScrollLocked=false;
+    const b=document.body, old=modal.savedBodyStyles||{};
+    document.documentElement.classList.remove('crop-modal-open');
+    b.classList.remove('crop-modal-open');
+    b.style.position=old.position||''; b.style.top=old.top||''; b.style.left=old.left||'';
+    b.style.right=old.right||''; b.style.width=old.width||''; b.style.overflow=old.overflow||'';
+    window.scrollTo(0,modal.savedPageScrollY||0);
+    modal.savedBodyStyles=null;
+}
+
+function cropOverlayElements(canvas){
+    const prefix=canvas.id==='videoCropCanvas'?'video':'image';
+    return {
+        layer:document.getElementById(prefix+'CropTouchLayer'),
+        rect:document.getElementById(prefix+'CropTouchRect')
+    };
+}
+
+function updateCropTouchOverlay(canvas){
+    const {layer,rect:rectEl}=cropOverlayElements(canvas);
+    if(!layer||!rectEl||!modal.naturalW||!modal.naturalH)return;
+    const {x,y,w,h}=modal.cropState;
+    const left=x/modal.naturalW*100, top=y/modal.naturalH*100;
+    const width=w/modal.naturalW*100, height=h/modal.naturalH*100;
+    rectEl.style.left=left+'%'; rectEl.style.top=top+'%'; rectEl.style.width=width+'%'; rectEl.style.height=height+'%';
+    const positions={
+        nw:[left,top], n:[left+width/2,top], ne:[left+width,top],
+        e:[left+width,top+height/2], se:[left+width,top+height],
+        s:[left+width/2,top+height], sw:[left,top+height], w:[left,top+height/2]
+    };
+    layer.querySelectorAll('.crop-touch-handle').forEach(el=>{
+        const p=positions[el.dataset.handle];
+        if(p){el.style.left=p[0]+'%';el.style.top=p[1]+'%';}
+    });
+}
+
+function cropDragTypeAt(canvas,target,clientX,clientY){
+    const handle=target&&target.closest?target.closest('.crop-touch-handle'):null;
+    if(handle)return handle.dataset.handle;
+    const r=canvas.getBoundingClientRect();
+    if(!r.width||!r.height)return null;
+    const nx=(clientX-r.left)/r.width*modal.naturalW;
+    const ny=(clientY-r.top)/r.height*modal.naturalH;
+    const {x,y,w,h}=modal.cropState;
+    return nx>=x&&nx<=x+w&&ny>=y&&ny<=y+h?'move':null;
+}
+
+function beginCropDrag(canvas,target,clientX,clientY,pointerId=null){
+    const dragType=cropDragTypeAt(canvas,target,clientX,clientY);
+    if(!dragType)return false;
+    modal.isDragging=true;
+    modal.dragType=dragType;
+    modal.activeCropCanvas=canvas;
+    modal.activePointerId=pointerId;
+    modal.dragStart={clientX,clientY,...modal.cropState};
+    return true;
+}
+
+function moveCropDrag(clientX,clientY){
+    if(!modal.isDragging||!modal.activeCropCanvas)return;
+    const cv=modal.activeCropCanvas;
+    const r=cv.getBoundingClientRect();
+    if(!r.width||!r.height)return;
+    const nw=modal.naturalW,nh=modal.naturalH;
+    const dx=(clientX-modal.dragStart.clientX)/r.width*nw;
+    const dy=(clientY-modal.dragStart.clientY)/r.height*nh;
+    let {x,y,w,h}=modal.dragStart,dt=modal.dragType;
+    if(dt==='move'){
+        x=Math.max(0,Math.min(nw-w,x+dx));
+        y=Math.max(0,Math.min(nh-h,y+dy));
+    }else{
+        if(dt.includes('e'))w=Math.max(8,Math.min(nw-x,w+dx));
+        if(dt.includes('s'))h=Math.max(8,Math.min(nh-y,h+dy));
+        if(dt.includes('w')){const nx=Math.max(0,Math.min(x+w-8,x+dx));w=x+w-nx;x=nx;}
+        if(dt.includes('n')){const ny=Math.max(0,Math.min(y+h-8,y+dy));h=y+h-ny;y=ny;}
+    }
+    modal.cropState={x:Math.round(x),y:Math.round(y),w:Math.round(w),h:Math.round(h)};
+    drawCrop(cv); syncCropInputs(); refreshVideoCropPreview();
+}
+
+function endCropDrag(){
+    modal.isDragging=false; modal.activeCropCanvas=null; modal.activePointerId=null;
+}
+
 function setupCropEvents(canvas){
-    canvas.onmousedown=e=>{
-        const {mx,my}=canvasXY(canvas,e);
-        modal.dragType=hitHandle(canvas,mx,my);
-        if(!modal.dragType)return;
-        modal.isDragging=true;
-        modal.activeCropCanvas=canvas;
-        modal.dragStart={mx,my,...modal.cropState};
-        e.preventDefault();
+    const {layer}=cropOverlayElements(canvas);
+    if(!layer)return;
+    updateCropTouchOverlay(canvas);
+    if(layer.dataset.cropBound==='1')return;
+    layer.dataset.cropBound='1';
+
+    layer.addEventListener('pointerdown',e=>{
+        e.preventDefault();e.stopPropagation();
+        if(e.isPrimary===false)return;
+        if(beginCropDrag(canvas,e.target,e.clientX,e.clientY,e.pointerId)){
+            try{layer.setPointerCapture(e.pointerId);}catch(_e){}
+        }
+    },{passive:false});
+    layer.addEventListener('pointermove',e=>{
+        if(!modal.isDragging||modal.activeCropCanvas!==canvas||modal.activePointerId!==e.pointerId)return;
+        e.preventDefault();e.stopPropagation();moveCropDrag(e.clientX,e.clientY);
+    },{passive:false});
+    const finishPointer=e=>{
+        if(modal.activeCropCanvas!==canvas)return;
+        if(modal.activePointerId!==null&&e.pointerId!==modal.activePointerId)return;
+        e.preventDefault();e.stopPropagation();endCropDrag();
     };
-    // Hover cursor only — drag handled by document-level listener
-    canvas.onmousemove=e=>{
-        if(modal.isDragging)return;
-        const {mx,my}=canvasXY(canvas,e);
-        canvas.style.cursor=CURSORS[hitHandle(canvas,mx,my)]||'crosshair';
+    layer.addEventListener('pointerup',finishPointer,{passive:false});
+    layer.addEventListener('pointercancel',finishPointer,{passive:false});
+
+    // Safari/older WebView fallback when Pointer Events are unavailable.
+    layer.addEventListener('touchstart',e=>{
+        if(window.PointerEvent)return;
+        e.preventDefault();e.stopPropagation();
+        const t=e.changedTouches[0];if(t)beginCropDrag(canvas,e.target,t.clientX,t.clientY,'touch');
+    },{passive:false});
+    layer.addEventListener('touchmove',e=>{
+        if(window.PointerEvent||!modal.isDragging||modal.activeCropCanvas!==canvas)return;
+        e.preventDefault();e.stopPropagation();
+        const t=e.changedTouches[0];if(t)moveCropDrag(t.clientX,t.clientY);
+    },{passive:false});
+    const finishTouch=e=>{
+        if(window.PointerEvent||modal.activeCropCanvas!==canvas)return;
+        e.preventDefault();e.stopPropagation();endCropDrag();
     };
-    // Register document-level handlers once
-    if(!modal._docCropHandlersAdded){
-        modal._docCropHandlersAdded=true;
-        document.addEventListener('mousemove',e=>{
-            if(!modal.isDragging||!modal.activeCropCanvas)return;
-            const cv=modal.activeCropCanvas;
-            const {mx,my}=canvasXY(cv,e);
-            const cw=cv.width,ch=cv.height,nw=modal.naturalW,nh=modal.naturalH;
-            const dx=(mx-modal.dragStart.mx)/cw*nw;
-            const dy=(my-modal.dragStart.my)/ch*nh;
-            let {x,y,w,h}=modal.dragStart,dt=modal.dragType;
-            if(dt==='move'){x=Math.max(0,Math.min(nw-w,x+dx));y=Math.max(0,Math.min(nh-h,y+dy));}
-            else{
-                if(dt.includes('e')){w=Math.max(8,Math.min(nw-x,w+dx));}
-                if(dt.includes('s')){h=Math.max(8,Math.min(nh-y,h+dy));}
-                if(dt.includes('w')){const nx=Math.max(0,Math.min(x+w-8,x+dx));w=x+w-nx;x=nx;}
-                if(dt.includes('n')){const ny=Math.max(0,Math.min(y+h-8,y+dy));h=y+h-ny;y=ny;}
-            }
-            modal.cropState={x:Math.round(x),y:Math.round(y),w:Math.round(w),h:Math.round(h)};
-            drawCrop(cv); syncCropInputs(); refreshVideoCropPreview();
-        });
-        document.addEventListener('mouseup',()=>{
-            modal.isDragging=false; modal.activeCropCanvas=null;
-        });
+    layer.addEventListener('touchend',finishTouch,{passive:false});
+    layer.addEventListener('touchcancel',finishTouch,{passive:false});
+
+    // Mouse fallback for older desktop browsers without Pointer Events.
+    layer.addEventListener('mousedown',e=>{
+        if(window.PointerEvent)return;
+        e.preventDefault();e.stopPropagation();beginCropDrag(canvas,e.target,e.clientX,e.clientY,'mouse');
+    });
+    document.addEventListener('mousemove',e=>{
+        if(window.PointerEvent||!modal.isDragging||modal.activeCropCanvas!==canvas)return;
+        e.preventDefault();moveCropDrag(e.clientX,e.clientY);
+    });
+    document.addEventListener('mouseup',()=>{
+        if(!window.PointerEvent&&modal.activeCropCanvas===canvas)endCropDrag();
+    });
+
+    if(!modal.documentTouchGuardBound){
+        modal.documentTouchGuardBound=true;
+        document.addEventListener('touchmove',e=>{
+            if(modal.isDragging||modal.isClipDrag){e.preventDefault();e.stopPropagation();}
+        },{capture:true,passive:false});
     }
 }
 
@@ -1221,40 +1525,90 @@ function onCropInputChange(){
     modal.cropState={x,y,w,h};
     const c=document.getElementById('imageCropCanvas');
     const vc=document.getElementById('videoCropCanvas');
-    if(c.width)drawCrop(c); if(vc.style.display!=='none')drawCrop(vc);
+    if(c.width)drawCrop(c); if(document.getElementById('videoCropShell').style.display!=='none')drawCrop(vc);
 }
 function clamp(v,lo,hi){return Math.max(lo,Math.min(hi,v));}
 
 // ---- Clip Timeline ----
 function setupClipTimeline(){
+    if(modal.clipTimelineBound)return;
+    modal.clipTimelineBound=true;
     const tl=document.getElementById('clipTimeline');
-    const sh=document.getElementById('clipStartHandle');
-    const eh=document.getElementById('clipEndHandle');
     const vid=document.getElementById('previewVideo');
 
-    function pct(e){const r=tl.getBoundingClientRect();return Math.max(0,Math.min(1,(e.clientX-r.left)/r.width));}
-
-    sh.addEventListener('mousedown',e=>{modal.isClipDrag=true;modal.clipDragType='start';e.preventDefault();e.stopPropagation();});
-    eh.addEventListener('mousedown',e=>{modal.isClipDrag=true;modal.clipDragType='end';e.preventDefault();e.stopPropagation();});
-
-    document.addEventListener('mousemove',e=>{
-        if(!modal.isClipDrag)return;
-        const t=pct(e)*modal.videoDuration;
+    function fractionAt(clientX){
+        const r=tl.getBoundingClientRect();
+        return Math.max(0,Math.min(1,(clientX-r.left)/Math.max(r.width,1)));
+    }
+    function updateClip(clientX){
+        if(!modal.videoDuration||!modal.clipDragType)return;
+        const t=fractionAt(clientX)*modal.videoDuration;
         if(modal.clipDragType==='start'){
-            modal.clipState.start=Math.max(0,Math.min(modal.clipState.end-.1,t));
+            modal.clipState.start=Math.max(0,Math.min(modal.clipState.end-.05,t));
             vid.currentTime=modal.clipState.start;
         }else{
-            modal.clipState.end=Math.max(modal.clipState.start+.1,Math.min(modal.videoDuration,t));
-            vid.currentTime=modal.clipState.end;
+            modal.clipState.end=Math.max(modal.clipState.start+.05,Math.min(modal.videoDuration,t));
+            vid.currentTime=Math.min(modal.clipState.end,modal.videoDuration);
         }
         syncClipTimeline();syncClipInputs();
-    });
-    document.addEventListener('mouseup',()=>{modal.isClipDrag=false;});
+    }
+    function beginClip(target,clientX,pointerId){
+        const handle=target&&target.closest?target.closest('.clip-handle'):null;
+        if(!handle){
+            vid.currentTime=fractionAt(clientX)*modal.videoDuration;
+            return false;
+        }
+        modal.isClipDrag=true;
+        modal.clipDragType=handle.dataset.clipHandle;
+        modal.clipPointerId=pointerId;
+        updateClip(clientX);
+        return true;
+    }
+    function finishClip(){
+        modal.isClipDrag=false;modal.clipDragType=null;modal.clipPointerId=null;
+    }
 
-    tl.addEventListener('click',e=>{
-        if(e.target===sh||e.target===eh)return;
-        vid.currentTime=pct(e)*modal.videoDuration;
+    tl.addEventListener('pointerdown',e=>{
+        if(!modal.videoDuration)return;
+        e.preventDefault();e.stopPropagation();
+        if(e.isPrimary===false)return;
+        if(beginClip(e.target,e.clientX,e.pointerId)){
+            try{tl.setPointerCapture(e.pointerId);}catch(_e){}
+        }
+    },{passive:false});
+    tl.addEventListener('pointermove',e=>{
+        if(!modal.isClipDrag||modal.clipPointerId!==e.pointerId)return;
+        e.preventDefault();e.stopPropagation();updateClip(e.clientX);
+    },{passive:false});
+    const finishPointer=e=>{
+        if(!modal.isClipDrag)return;
+        if(modal.clipPointerId!==null&&e.pointerId!==modal.clipPointerId)return;
+        e.preventDefault();e.stopPropagation();finishClip();
+    };
+    tl.addEventListener('pointerup',finishPointer,{passive:false});
+    tl.addEventListener('pointercancel',finishPointer,{passive:false});
+
+    tl.addEventListener('touchstart',e=>{
+        if(window.PointerEvent||!modal.videoDuration)return;
+        e.preventDefault();e.stopPropagation();
+        const t=e.changedTouches[0];if(t)beginClip(e.target,t.clientX,'touch');
+    },{passive:false});
+    tl.addEventListener('touchmove',e=>{
+        if(window.PointerEvent||!modal.isClipDrag)return;
+        e.preventDefault();e.stopPropagation();
+        const t=e.changedTouches[0];if(t)updateClip(t.clientX);
+    },{passive:false});
+    tl.addEventListener('touchend',e=>{if(!window.PointerEvent&&modal.isClipDrag){e.preventDefault();finishClip();}},{passive:false});
+    tl.addEventListener('touchcancel',e=>{if(!window.PointerEvent&&modal.isClipDrag){e.preventDefault();finishClip();}},{passive:false});
+
+    tl.addEventListener('mousedown',e=>{
+        if(window.PointerEvent||!modal.videoDuration)return;
+        e.preventDefault();beginClip(e.target,e.clientX,'mouse');
     });
+    document.addEventListener('mousemove',e=>{
+        if(!window.PointerEvent&&modal.isClipDrag){e.preventDefault();updateClip(e.clientX);}
+    });
+    document.addEventListener('mouseup',()=>{if(!window.PointerEvent&&modal.isClipDrag)finishClip();});
 
     vid.addEventListener('timeupdate',()=>{
         const ph=document.getElementById('clipPlayhead');
@@ -1279,8 +1633,14 @@ function syncClipInputs(){
 }
 
 function onClipInputChange(){
-    modal.clipState.start=fromTS(document.getElementById('clipStartInput').value);
-    modal.clipState.end  =fromTS(document.getElementById('clipEndInput').value);
+    if(!modal.videoDuration)return;
+    let start=clamp(fromTS(document.getElementById('clipStartInput').value),0,modal.videoDuration);
+    let end=clamp(fromTS(document.getElementById('clipEndInput').value),0,modal.videoDuration);
+    if(end<=start){
+        if(start>=modal.videoDuration)start=Math.max(0,modal.videoDuration-.05);
+        end=Math.min(modal.videoDuration,start+.05);
+    }
+    modal.clipState={start,end};
     syncClipTimeline();syncClipInputs();
 }
 
@@ -1318,7 +1678,7 @@ function resetEdits(){
     if(modal.mediaType==='video') modal.clipState={start:0,end:modal.videoDuration};
     const c=document.getElementById('imageCropCanvas');
     const vc=document.getElementById('videoCropCanvas');
-    if(c.width)drawCrop(c); if(vc.style.display!=='none')drawCrop(vc);
+    if(c.width)drawCrop(c); if(document.getElementById('videoCropShell').style.display!=='none')drawCrop(vc);
     syncCropInputs();
     if(modal.mediaType==='video'){syncClipTimeline();syncClipInputs();}
 }
@@ -1361,6 +1721,8 @@ function toggleVideoCropCanvas(){
 }
 
 function closePreviewModal(){
+    endCropDrag();
+    unlockPageBehindCropModal();
     const vid=document.getElementById('previewVideo');
     vid.pause(); vid.src=''; vid.style.clipPath='';
     cropPreviewActive=false;
@@ -1368,12 +1730,8 @@ function closePreviewModal(){
     if(cpBtn)cpBtn.textContent='👁 Preview Crop';
     if(modal.objectUrl){URL.revokeObjectURL(modal.objectUrl);modal.objectUrl=null;}
     modal.capturedImg=null;
-    ['imageCropCanvas','videoCropCanvas'].forEach(id=>{
-        const c=document.getElementById(id);
-        c.onmousedown=c.onmousemove=null;
-    });
-    const vcWrap=document.getElementById('videoCropWrap');
-    if(vcWrap) vcWrap.style.display='';
+    const vcShell=document.getElementById('videoCropShell');
+    if(vcShell) vcShell.style.display='none';
     const vcBtn=document.getElementById('videoCropCollapseBtn');
     if(vcBtn) vcBtn.textContent='▲ Collapse';
     document.getElementById('previewModal').style.display='none';
@@ -1388,12 +1746,21 @@ function closePreviewModal(){
 # FLASK ROUTES
 # ==========================================
 
+@app.after_request
+def disable_browser_cache(response):
+    """Always deliver the current embedded UI/JavaScript during local development."""
+    response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+    response.headers['Pragma'] = 'no-cache'
+    response.headers['Expires'] = '0'
+    return response
+
 @app.route('/')
 def index():
     return render_template_string(HTML_TEMPLATE,
         formats_json=json.dumps([f.to_dict() for f in FORMATS]),
         setting_help=json.dumps(SETTING_HELP),
-        favicon=FAVICON_BASE64)
+        favicon=FAVICON_BASE64,
+        probe_full_upload_limit_bytes=PROBE_FULL_UPLOAD_LIMIT_MB * 1024 * 1024)
 
 @app.route('/reset', methods=['POST'])
 def reset_all():
@@ -1408,33 +1775,70 @@ def reset_session(session_id):
 
 @app.route('/probe', methods=['POST'])
 def probe():
-    if 'file' not in request.files: return jsonify({})
+    if 'file' not in request.files:
+        return jsonify({})
     file = request.files['file']
-    if not file.filename or '.' not in file.filename: return jsonify({})
-    ext = "." + file.filename.rsplit('.',1)[-1]
+    if not file.filename or '.' not in file.filename:
+        return jsonify({})
+
+    ext = "." + file.filename.rsplit('.', 1)[-1]
     tmp = os.path.join(BASE_TEMP_DIR, f"probe_{uuid.uuid4().hex}{ext}")
     file.save(tmp)
     meta = {}
     try:
-        proc = run_command([FFPROBE_CMD,'-v','quiet','-print_format','json',
-                            '-show_format','-show_streams',tmp])
-        data = json.loads(proc.stdout.decode())
-        for s in data.get('streams',[]):
-            if s.get('codec_type')=='video' and 'Resolution' not in meta:
-                meta['Resolution'] = f"{s.get('width')}x{s.get('height')}"
-                if s.get('r_frame_rate') and '/' in s.get('r_frame_rate'):
-                    n,d = s['r_frame_rate'].split('/')
-                    if d!='0': meta['FPS'] = str(round(int(n)/int(d),2))
-                if s.get('bit_rate'): meta['Video Bitrate'] = f"{int(s['bit_rate'])//1000}k"
-            elif s.get('codec_type')=='audio' and 'Sample Rate' not in meta:
-                meta['Sample Rate'] = s.get('sample_rate')
-                if s.get('bit_rate'): meta['Audio Bitrate'] = f"{int(s['bit_rate'])//1000}k"
-        if 'Video Bitrate' not in meta and 'bit_rate' in data.get('format',{}):
-            meta['Video Bitrate'] = f"{int(data['format']['bit_rate'])//1000}k"
-    except Exception as e:
-        print(f"Probe error: {e}")
+        cmd = [
+            FFPROBE_CMD, '-v', 'error',
+            '-probesize', '50M', '-analyzeduration', '100M',
+            '-print_format', 'json',
+            '-show_entries',
+            'stream=codec_type,width,height,r_frame_rate,avg_frame_rate,bit_rate,sample_rate:format=bit_rate',
+            tmp
+        ]
+        proc = subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            startupinfo=make_startupinfo(), timeout=45
+        )
+        if proc.returncode != 0:
+            detail = proc.stderr.decode(errors='replace').strip().splitlines()
+            if detail:
+                print(f"Probe skipped for {file.filename}: {detail[-1]}")
+            return jsonify({})
+
+        data = json.loads(proc.stdout.decode(errors='replace') or '{}')
+        for stream in data.get('streams', []):
+            if stream.get('codec_type') == 'video' and 'Resolution' not in meta:
+                width, height = stream.get('width'), stream.get('height')
+                if width and height:
+                    meta['Resolution'] = f"{width}x{height}"
+                rate = stream.get('avg_frame_rate') or stream.get('r_frame_rate')
+                if rate and '/' in rate:
+                    numerator, denominator = rate.split('/', 1)
+                    try:
+                        if float(denominator) != 0:
+                            meta['FPS'] = str(round(float(numerator) / float(denominator), 2))
+                    except ValueError:
+                        pass
+                if stream.get('bit_rate'):
+                    meta['Video Bitrate'] = f"{int(stream['bit_rate']) // 1000}k"
+            elif stream.get('codec_type') == 'audio' and 'Sample Rate' not in meta:
+                if stream.get('sample_rate'):
+                    meta['Sample Rate'] = stream['sample_rate']
+                if stream.get('bit_rate'):
+                    meta['Audio Bitrate'] = f"{int(stream['bit_rate']) // 1000}k"
+
+        format_bitrate = data.get('format', {}).get('bit_rate')
+        if 'Video Bitrate' not in meta and format_bitrate:
+            meta['Video Bitrate'] = f"{int(format_bitrate) // 1000}k"
+    except subprocess.TimeoutExpired:
+        print(f"Probe timed out for {file.filename}; browser metadata will be used.")
+    except Exception as exc:
+        print(f"Probe skipped for {file.filename}: {exc}")
     finally:
-        if os.path.exists(tmp): os.remove(tmp)
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
     return jsonify(meta)
 
 @app.route('/convert', methods=['POST'])
@@ -1555,7 +1959,6 @@ def resolve_network_mode(argv=None):
     if selected_mode:
         return selected_mode
 
-    # Preserve the original interactive behaviour when no mode was supplied.
     while True:
         answer = input(
             "Enter LAN to allow other devices, or LOCAL for this machine only [LOCAL]: "
@@ -1567,37 +1970,126 @@ def resolve_network_mode(argv=None):
         print("Please enter LAN or LOCAL.")
 
 
+def get_lan_ips():
+    """Return usable IPv4 LAN addresses, with the default-route address first."""
+    found = []
+
+    # A UDP connect does not send application data. It asks the OS which local
+    # interface/address it would use, avoiding unreliable hostname resolution.
+    for target in (("8.8.8.8", 80), ("1.1.1.1", 80)):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.settimeout(1.0)
+            sock.connect(target)
+            found.append(sock.getsockname()[0])
+        except OSError:
+            pass
+        finally:
+            sock.close()
+
+    # Also include other active IPv4 adapters (useful with Ethernet + Wi-Fi,
+    # VPNs, or when the machine has no internet route).
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            found.append(info[4][0])
+    except OSError:
+        pass
+
+    usable = []
+    for value in found:
+        try:
+            address = ipaddress.ip_address(value)
+        except ValueError:
+            continue
+        if address.version != 4 or address.is_loopback or address.is_link_local or address.is_unspecified:
+            continue
+        if value not in usable:
+            usable.append(value)
+
+    # Prefer RFC1918/private LAN addresses over VPN/public adapter addresses.
+    return sorted(usable, key=lambda value: (not ipaddress.ip_address(value).is_private, usable.index(value)))
+
+
+def configure_windows_firewall(port):
+    """Allow TCP access from the local subnet on Windows, when elevated."""
+    if platform.system() != "Windows":
+        return
+
+    rule_name = f"LocalFileConverter_{port}"
+    command = [
+        "netsh", "advfirewall", "firewall", "add", "rule",
+        f"name={rule_name}", "dir=in", "action=allow", "enable=yes",
+        "protocol=TCP", f"localport={port}", "profile=any",
+        "remoteip=localsubnet",
+    ]
+
+    try:
+        import ctypes
+        is_admin = bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        is_admin = False
+
+    if not is_admin:
+        print("⚠️  Windows Firewall rule was not changed (Administrator rights required).")
+        print("   Re-run this program as Administrator once, or allow this command in an")
+        print("   elevated Command Prompt:")
+        print("   " + " ".join(command))
+        return
+
+    try:
+        subprocess.run(
+            ["netsh", "advfirewall", "firewall", "delete", "rule", f"name={rule_name}"],
+            capture_output=True, text=True, check=False,
+        )
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+        if result.returncode == 0:
+            print(f"✅ Windows Firewall: LAN access allowed on TCP port {port}.")
+        else:
+            detail = (result.stderr or result.stdout).strip()
+            print(f"⚠️  Windows Firewall rule could not be added (exit {result.returncode}).")
+            if detail:
+                print(f"   {detail}")
+    except OSError as exc:
+        print(f"⚠️  Could not run Windows Firewall command: {exc}")
+
+
 if __name__ == '__main__':
     network_mode = resolve_network_mode()
     HOST = "0.0.0.0" if network_mode == "lan" else "127.0.0.1"
+
     wipe_temp_folder()
-    print("="*55)
+    print("=" * 55)
     print("  Fully Local File Converter")
-    print("="*55)
+    print("=" * 55)
     print(f"Network mode: {network_mode.upper()} ({HOST})")
+
     if not shutil.which("ffmpeg"):
-        print("\n\u274c CRITICAL: FFmpeg not found in PATH! Install FFmpeg.")
+        print("\n❌ CRITICAL: FFmpeg not found in PATH! Install FFmpeg.")
     else:
-        print(f"\u2705 FFmpeg detected.")
-    print(f"\nOpen http://127.0.0.1:{PORT} in your browser.")
-    if HOST=='0.0.0.0':
-        import socket
-        try:
-            ip = socket.gethostbyname(socket.gethostname())
-            print(f"LAN access:    http://{ip}:{PORT}")
-        except: pass
-        if platform.system()=='Windows':
-            try:
-                r = subprocess.run(
-                    ['netsh','advfirewall','firewall','add','rule',
-                     f'name=LocalFileConverter_{PORT}','dir=in','action=allow',
-                     'protocol=TCP',f'localport={PORT}'],
-                    capture_output=True, text=True)
-                if r.returncode==0:
-                    print(f"\u2705 Windows Firewall: inbound rule added for port {PORT}.")
-                else:
-                    print(f"\u26a0\ufe0f  Firewall rule not added — run as Administrator once,")
-                    print(f"   or allow port {PORT} manually in Windows Defender Firewall.")
-            except Exception: pass
+        print("✅ FFmpeg detected.")
+
+    print(f"\nLocal access: http://127.0.0.1:{PORT}")
+
+    if network_mode == "lan":
+        lan_ips = get_lan_ips()
+        if lan_ips:
+            print(f"LAN access:   http://{lan_ips[0]}:{PORT}")
+            for alternate_ip in lan_ips[1:]:
+                print(f"Alternative:  http://{alternate_ip}:{PORT}")
+        else:
+            print("⚠️  No usable LAN IPv4 address was detected.")
+            print("   Run 'ipconfig' (Windows) or 'ip addr' (Linux) and use the")
+            print(f"   active adapter's IPv4 address with port {PORT}.")
+
+        configure_windows_firewall(PORT)
+        print("\nOn the other device, use the LAN URL shown above—not 0.0.0.0 or 127.0.0.1.")
+        print("Both devices must be on the same LAN, and guest/AP isolation must be disabled.")
+
     print()
-    serve(app, host=HOST, port=PORT, threads=8)
+
+    # Explicitly listen on every IPv4 interface in LAN mode. Using Waitress's
+    # listen form avoids accidentally falling back to localhost-only defaults.
+    if network_mode == "lan":
+        serve(app, listen=f"0.0.0.0:{PORT}", threads=8)
+    else:
+        serve(app, host="127.0.0.1", port=PORT, threads=8)
