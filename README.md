@@ -437,3 +437,9 @@ Close any browser tabs connected to the converter. In LAN mode, stopping the Pyt
 * LAN mode is intended only for trusted local networks.
 * Do not close or reload the browser page while an upload or conversion is running.
 * The converter is not intended to be exposed as a public internet service.
+
+---
+
+### Transparency notice
+
+This project was used generative AI to streamline development. I believe in transparent use of these tools and I have gone through multiple polishing and testing iterations to make sure the final result is up to a good finished standard.
